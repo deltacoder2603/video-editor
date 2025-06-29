@@ -177,7 +177,6 @@ A modern, full-stack video editing application that combines the power of FFmpeg
 
 - **Use AI**: Enable AI-powered profanity detection
 - **Use All Profanity**: Include all detected profanity words
-- **API Key**: Google Cloud Speech API key for enhanced detection
 - **Custom Words**: Add your own words to the filter list
 - **Strict Mode**: Enable stricter filtering
 - **Confidence Threshold**: Set detection sensitivity (0.0 - 1.0)
