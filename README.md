@@ -96,7 +96,6 @@ A modern, full-stack video editing application that combines the power of FFmpeg
    Create `.env` in the backend directory:
    ```env
    PORT=3001
-   GOOGLE_CLOUD_SPEECH_API_KEY=your_api_key_here
    ```
 
 5. **Install FFmpeg**
