@@ -65,7 +65,6 @@ A modern, full-stack video editing application that combines the power of FFmpeg
 - Node.js 16+ 
 - FFmpeg installed on your system
 - Whisper (OpenAI) for speech transcription
-- Google Cloud Speech API (optional)
 
 ### Installation
 
