@@ -14,13 +14,41 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Progress logging utility
+let customProfanityList = new Set();
+let videoSessions = new Map();
+let editHistory = new Map();
+
+const englishProfanity = [
+  "damn", "hell", "crap", "piss", "ass", "bitch", "bastard", "shit", "fuck", 
+  "fucking", "motherfucker", "cocksucker", "dickhead", "asshole", "bullshit", 
+  "dumbass", "jackass", "smartass", "cunt", "whore", "slut", "faggot", "nigger", 
+  "retard", "goddamn", "jesus christ", "holy shit", "god damn", "dick", "cock", 
+  "pussy", "tits", "boobs", "balls", "wtf", "stfu", "gtfo", "omfg", "fml",
+  "f*ck", "f**k", "sh*t", "b*tch", "a**hole", "d*mn"
+];
+
+const hindiProfanity = [
+  "चूतिया", "मादरचोद", "बहनचोद", "भोसड़ीके", "रंडी", "हरामी", "कमीना", 
+  "कुत्ता", "कुत्ती", "साला", "साली", "गांडू", "लंड", "लौड़ा", "भोसड़ा", 
+  "चूत", "गांड", "बहन की चूत", "मां की चूत", "तेरी मां", "चिनाल", "पटाका", 
+  "हिजड़ा", "चक्का", "आइटम", "रांड", "भड़वा", "दलाल", "चिनल", "कमीनी", 
+  "हरामखोर", "नाजायज", "बदमाश", "गुंडा", "लफंगा", "कुत्ते", "सुअर", 
+  "कमीने", "हरामजादे", "बेशर्म", "निकम्मा", "बेवकूफ", "गधा", "उल्लू"
+];
+
+function getAllProfanityWords(customWords = []) {
+  return new Set([
+    ...englishProfanity.map(w => w.toLowerCase()),
+    ...hindiProfanity.map(w => w.toLowerCase()),
+    ...Array.from(customProfanityList),
+    ...customWords.map(w => w.toLowerCase())
+  ]);
+}
+
 const logProgress = (emoji, message, data = null) => {
   const timestamp = new Date().toISOString().slice(11, 19);
   console.log(`${emoji} [${timestamp}] ${message}`);
-  if (data) {
-    console.log(`   📊 Data:`, data);
-  }
+  if (data) console.log(`   📊 Data:`, data);
 };
 
 const storage = multer.diskStorage({
@@ -43,12 +71,8 @@ const upload = multer({
     const extname = allowedExtensions.test(file.originalname);
     const allowedMimeTypes = /^video\/(mp4|avi|mov|wmv|flv|webm|mkv|m4v|3gp|x-msvideo|quicktime)$/i;
     const mimetype = allowedMimeTypes.test(file.mimetype);
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Only video files are allowed'));
-    }
+    if (mimetype && extname) return cb(null, true);
+    cb(new Error('Only video files are allowed'));
   }
 });
 
@@ -68,8 +92,17 @@ async function parseSRT(srtPath) {
     if (/^\d+$/.test(lines[i])) {
       const timestamp = lines[i + 1];
       const text = lines[i + 2];
-      const [start, end] = timestamp.split(' --> ');
-      entries.push({ start, end, text });
+      if (timestamp && text) {
+        const [start, end] = timestamp.split(' --> ');
+        entries.push({ 
+          index: parseInt(lines[i]),
+          start, 
+          end, 
+          text,
+          startSeconds: srtTimeToSeconds(start),
+          endSeconds: srtTimeToSeconds(end)
+        });
+      }
       i += 4;
     } else {
       i++;
@@ -79,74 +112,76 @@ async function parseSRT(srtPath) {
   return entries;
 }
 
-function findProfanityTimestamps(entries, lang = 'hi') {
-  logProgress('🔍', `Scanning for profanity in ${entries.length} subtitle entries`, { language: lang });
+function findProfanityTimestamps(entries, lang = 'hi', customWords = []) {
+  logProgress('🔍', `Scanning for profanity in ${entries.length} subtitle entries`);
   const profaneTimestamps = [];
+  const detectedWords = [];
   let profaneCount = 0;
   
+  const allProfanity = getAllProfanityWords(customWords);
+  
   for (const entry of entries) {
-    const filtered = filterBadWords(entry.text, lang);
-    if (filtered !== entry.text) {
+    const words = entry.text.split(' ');
+    const highlightedWords = [];
+    let hasProfanity = false;
+    
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      const wordLower = word.toLowerCase();
+      const filtered = filterBadWords(word, lang);
+      
+      const isProfane = allProfanity.has(wordLower) || filtered !== word;
+      
+      if (isProfane) {
+        highlightedWords.push({
+          word,
+          index: i,
+          isProfane: true,
+          detectedBy: filtered !== word ? 'filter' : 'list'
+        });
+        detectedWords.push({ word, timestamp: entry.start, sentence: entry.text });
+        hasProfanity = true;
+      } else {
+        highlightedWords.push({ word, index: i, isProfane: false });
+      }
+    }
+    
+    if (hasProfanity) {
       profaneCount++;
       profaneTimestamps.push({ 
-        start: srtTimeToSeconds(entry.start), 
-        end: srtTimeToSeconds(entry.end) 
+        start: entry.startSeconds, 
+        end: entry.endSeconds,
+        text: entry.text,
+        highlightedWords,
+        index: entry.index
       });
-      logProgress('🚨', `Profanity detected at ${entry.start} - ${entry.end}`, { original: entry.text, filtered });
     }
   }
   
-  logProgress('📊', `Profanity scan completed - Found ${profaneCount} profane segments out of ${entries.length} entries`);
-  return profaneTimestamps;
+  logProgress('📊', `Profanity scan completed - Found ${profaneCount} profane segments`);
+  return { segments: profaneTimestamps, detectedWords };
 }
 
 async function extractAudio(inputPath, outputPath) {
-  logProgress('🎵', 'Starting audio extraction', { input: path.basename(inputPath), output: path.basename(outputPath) });
-  
+  logProgress('🎵', 'Starting audio extraction');
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .output(outputPath)
       .noVideo()
       .audioCodec('pcm_s16le')
-      .on('start', (commandLine) => {
-        logProgress('⚡', 'FFmpeg audio extraction started', { command: commandLine });
-      })
-      .on('progress', (progress) => {
-        logProgress('📈', `Audio extraction progress: ${Math.round(progress.percent || 0)}%`);
-      })
-      .on('end', () => {
-        logProgress('✅', 'Audio extraction completed successfully');
-        resolve();
-      })
-      .on('error', (err) => {
-        logProgress('❌', 'Audio extraction failed', { error: err.message });
-        reject(err);
-      })
+      .on('end', resolve)
+      .on('error', reject)
       .run();
   });
 }
 
-async function transcribeAudio(audioPath, tempDir, language = 'hi') {
-  logProgress('🎙️', 'Starting audio transcription with Whisper', { 
-    audio: path.basename(audioPath), 
-    language, 
-    outputDir: tempDir 
-  });
-  
+async function transcribeAudio(audioPath, tempDir, language = 'hi', model = 'large') {
+  logProgress('🎙️', `Starting audio transcription with Whisper model: ${model}`);
   return new Promise((resolve, reject) => {
-    const startTime = Date.now();
     exec(
-      `whisper "${audioPath}" --language ${language} --task transcribe --output_format srt --output_dir "${tempDir}"`,
+      `whisper "${audioPath}" --language ${language} --task transcribe --output_format json --word_timestamps True --output_dir "${tempDir}" --model ${model}`,
       (error, stdout, stderr) => {
-        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-        
-        if (error) {
-          logProgress('❌', `Whisper transcription failed after ${duration}s`, { error: error.message });
-          return reject(error);
-        }
-        
-        logProgress('✅', `Whisper transcription completed in ${duration}s`);
-        if (stdout) logProgress('📝', 'Whisper stdout', { output: stdout.slice(0, 200) + '...' });
+        if (error) return reject(error);
         resolve();
       }
     );
@@ -154,34 +189,18 @@ async function transcribeAudio(audioPath, tempDir, language = 'hi') {
 }
 
 async function muteProfanitySegments(inputPath, outputPath, segments) {
-  logProgress('🔇', 'Starting profanity muting process', { 
-    input: path.basename(inputPath), 
-    output: path.basename(outputPath),
-    segmentsToMute: segments.length 
-  });
-  
+  logProgress('🔇', 'Starting profanity muting process');
   return new Promise((resolve, reject) => {
     if (segments.length === 0) {
-      logProgress('ℹ️', 'No profanity segments found - copying file as-is');
       ffmpeg(inputPath)
         .outputOptions(['-c', 'copy'])
         .output(outputPath)
-        .on('start', (commandLine) => {
-          logProgress('⚡', 'FFmpeg copy started', { command: commandLine });
-        })
-        .on('end', () => {
-          logProgress('✅', 'File copy completed');
-          resolve({ filename: path.basename(outputPath) });
-        })
-        .on('error', (err) => {
-          logProgress('❌', 'File copy failed', { error: err.message });
-          reject(err);
-        })
+        .on('end', () => resolve({ filename: path.basename(outputPath) }))
+        .on('error', reject)
         .run();
       return;
     }
     
-    logProgress('🔧', 'Building audio filter for profanity muting', { segments });
     let audioFilter = '[0:a]';
     const volumeFilters = segments.map(({ start, end }) => 
       `volume=enable='between(t,${start},${end})':volume=0`
@@ -198,131 +217,96 @@ async function muteProfanitySegments(inputPath, outputPath, segments) {
         '-movflags', '+faststart'
       ])
       .output(outputPath)
-      .on('start', (commandLine) => {
-        logProgress('⚡', 'FFmpeg profanity muting started', { command: commandLine });
-      })
-      .on('progress', (progress) => {
-        logProgress('📈', `Profanity muting progress: ${Math.round(progress.percent || 0)}%`);
-      })
-      .on('end', () => {
-        logProgress('✅', `Profanity muting completed - ${segments.length} segments muted`);
-        resolve({ filename: path.basename(outputPath) });
-      })
-      .on('error', (err) => {
-        logProgress('❌', 'Profanity muting failed', { error: err.message });
-        reject(err);
-      })
+      .on('end', () => resolve({ filename: path.basename(outputPath) }))
+      .on('error', reject)
       .run();
   });
 }
 
-app.post('/api/detect-profanity', async (req, res) => {
-  const { fileId, language = 'hi' } = req.body;
-  logProgress('🚀', 'Starting profanity detection process', { fileId, language });
-  
+async function parseWhisperJson(jsonPath) {
+  logProgress('📄', 'Parsing Whisper JSON file', { path: jsonPath });
+  const data = await fs.readFile(jsonPath, 'utf8');
+  const json = JSON.parse(data);
+  const entries = [];
+  let index = 1;
+  for (const segment of json.segments) {
+    entries.push({
+      index: index++,
+      start: segment.start,
+      end: segment.end,
+      text: segment.text.trim(),
+      startSeconds: segment.start,
+      endSeconds: segment.end,
+      words: segment.words?.map(w => ({
+        word: w.word.trim(),
+        start: w.start,
+        end: w.end
+      })) || []
+    });
+  }
+  logProgress('✅', `Whisper JSON parsing completed - Found ${entries.length} segments`);
+  return entries;
+}
+
+app.post('/api/session/create', async (req, res) => {
   try {
-    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
-    const tempDir = path.join(__dirname, 'temp');
-    const audioPath = path.join(tempDir, `${fileId}_audio.wav`);
-    const srtPath = path.join(tempDir, `${fileId}_audio.srt`);
-    
-    logProgress('📁', 'Creating temporary directory', { tempDir });
-    await fs.mkdir(tempDir, { recursive: true });
-    
-    await extractAudio(inputPath, audioPath);
-    await transcribeAudio(audioPath, tempDir, language);
-    
-    const entries = await parseSRT(srtPath);
-    const segments = findProfanityTimestamps(entries, language);
-    
-    logProgress('🧹', 'Cleaning up temporary files');
-    await fs.unlink(audioPath).catch(() => {});
-    await fs.unlink(srtPath).catch(() => {});
-    
-    const totalDuration = segments.reduce((sum, seg) => sum + (seg.end - seg.start), 0);
-    logProgress('🎯', 'Profanity detection completed', { 
-      segmentsFound: segments.length,
-      totalDurationToMute: `${totalDuration.toFixed(2)}s`
+    const sessionId = uuidv4();
+    videoSessions.set(sessionId, {
+      id: sessionId,
+      videos: [],
+      createdAt: new Date(),
+      currentVersion: 0
     });
+    editHistory.set(sessionId, []);
     
-    res.json({
-      success: true,
-      segments,
-      profanityCount: segments.length,
-      totalDuration
-    });
+    res.json({ success: true, sessionId });
   } catch (error) {
-    logProgress('💥', 'Profanity detection error', { error: error.message });
-    console.error('Profanity detection error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/api/process/profanity', async (req, res) => {
-  const { fileId, segments, language = 'hi' } = req.body;
-  logProgress('🚀', 'Starting profanity processing', { fileId, providedSegments: segments?.length || 0, language });
+app.post('/api/upload-multiple', upload.array('videos', 10), async (req, res) => {
+  const { sessionId } = req.body;
+  logProgress('📤', 'Processing multiple file uploads');
   
   try {
-    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
-    const outputPath = path.join(__dirname, 'processed', `${fileId}_profanity_filtered.mp4`);
-    
-    logProgress('📁', 'Creating processed directory');
-    await fs.mkdir(path.dirname(outputPath), { recursive: true });
-    
-    let finalSegments = segments;
-    
-    if (!segments || segments.length === 0) {
-      logProgress('🔍', 'No segments provided - performing automatic detection');
-      const tempDir = path.join(__dirname, 'temp');
-      const audioPath = path.join(tempDir, `${fileId}_audio.wav`);
-      const srtPath = path.join(tempDir, `${fileId}_audio.srt`);
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    const session = videoSessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const uploadedFiles = [];
+    for (const file of req.files) {
+      const fileInfo = {
+        id: path.parse(file.filename).name,
+        originalName: file.originalname,
+        filename: file.filename,
+        size: file.size,
+        path: file.path,
+        uploadedAt: new Date()
+      };
       
-      await fs.mkdir(tempDir, { recursive: true });
-      await extractAudio(inputPath, audioPath);
-      await transcribeAudio(audioPath, tempDir, language);
-      
-      const entries = await parseSRT(srtPath);
-      finalSegments = findProfanityTimestamps(entries, language);
-      
-      logProgress('🧹', 'Cleaning up temporary files');
-      await fs.unlink(audioPath).catch(() => {});
-      await fs.unlink(srtPath).catch(() => {});
+      const videoInfo = await getVideoInfo(file.path);
+      uploadedFiles.push({ ...fileInfo, videoInfo });
+      session.videos.push(fileInfo);
     }
     
-    const result = await muteProfanitySegments(inputPath, outputPath, finalSegments);
-    
-    logProgress('🎉', 'Profanity processing completed successfully', {
-      outputFile: result.filename,
-      segmentsMuted: finalSegments.length
-    });
-    
-    res.json({
-      success: true,
-      outputFile: result.filename,
-      downloadUrl: `/api/download/${result.filename}`,
-      segmentsMuted: finalSegments.length
-    });
+    res.json({ success: true, files: uploadedFiles, sessionId });
   } catch (error) {
-    logProgress('💥', 'Profanity processing error', { error: error.message });
-    console.error('Profanity processing error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/api/upload', upload.single('video'), async (req, res) => {
   logProgress('📤', 'Processing file upload');
-  
   try {
     if (!req.file) {
-      logProgress('❌', 'Upload failed - No file provided');
       return res.status(400).json({ error: 'No file uploaded' });
     }
-
-    logProgress('📋', 'File uploaded successfully', {
-      originalName: req.file.originalname,
-      filename: req.file.filename,
-      size: `${(req.file.size / (1024 * 1024)).toFixed(2)} MB`
-    });
 
     const fileInfo = {
       id: path.parse(req.file.filename).name,
@@ -333,74 +317,383 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
       uploadedAt: new Date()
     };
 
-    logProgress('🔍', 'Analyzing video metadata');
     const videoInfo = await getVideoInfo(req.file.path);
-    logProgress('✅', 'Video analysis completed', videoInfo);
+    res.json({ success: true, file: fileInfo, videoInfo });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/transcribe', async (req, res) => {
+  const { fileId, language = 'hi' } = req.body;
+  logProgress('🚀', 'Starting transcription process');
+  try {
+    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
+    const tempDir = path.join(__dirname, 'temp');
+    const audioPath = path.join(tempDir, `${fileId}_audio.wav`);
+    const jsonPath = path.join(tempDir, `${fileId}_audio.json`);
+
+    await fs.mkdir(tempDir, { recursive: true });
+    await extractAudio(inputPath, audioPath);
+    await transcribeAudio(audioPath, tempDir, language, 'large');
+
+    const entries = await parseWhisperJson(jsonPath);
+
+    await fs.unlink(audioPath).catch(() => {});
+    await fs.unlink(jsonPath).catch(() => {});
+
+    res.json({ success: true, transcript: entries });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/detect-profanity', async (req, res) => {
+  const { fileId, language = 'hi', customWords = [] } = req.body;
+  logProgress('🚀', 'Starting profanity detection process');
+  try {
+    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
+    const tempDir = path.join(__dirname, 'temp');
+    const audioPath = path.join(tempDir, `${fileId}_audio.wav`);
+    const jsonPath = path.join(tempDir, `${fileId}_audio.json`);
+
+    await fs.mkdir(tempDir, { recursive: true });
+    await extractAudio(inputPath, audioPath);
+    await transcribeAudio(audioPath, tempDir, language, 'large');
+
+    const entries = await parseWhisperJson(jsonPath);
+    const result = findProfanityTimestamps(entries, language, customWords);
+
+    await fs.unlink(audioPath).catch(() => {});
+    await fs.unlink(jsonPath).catch(() => {});
+
+    res.json({
+      success: true,
+      transcript: entries,
+      profanityData: result,
+      totalSegments: result.segments.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/custom-profanity/add', async (req, res) => {
+  const { words } = req.body;
+  try {
+    words.forEach(word => customProfanityList.add(word.toLowerCase()));
+    res.json({ success: true, totalCustomWords: customProfanityList.size });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/custom-profanity', async (req, res) => {
+  try {
+    res.json({ success: true, words: Array.from(customProfanityList) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/process/profanity', async (req, res) => {
+  const { fileId, segments, language = 'hi', selectedWords = [], sessionId, sourceVersion = 'original' } = req.body;
+  logProgress('🚀', 'Starting profanity processing');
+  
+  try {
+    const session = videoSessions.get(sessionId);
+    let inputPath;
+    
+    if (sourceVersion === 'original') {
+      inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
+    } else {
+      const history = editHistory.get(sessionId) || [];
+      const versionEntry = history.find(h => h.version === parseInt(sourceVersion));
+      if (!versionEntry) {
+        return res.status(404).json({ error: 'Version not found' });
+      }
+      inputPath = path.join(__dirname, 'processed', versionEntry.filename);
+    }
+    
+    const outputPath = path.join(__dirname, 'processed', `${fileId}_v${session.currentVersion + 1}_profanity_filtered.mp4`);
+    
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    
+    selectedWords.forEach(word => customProfanityList.add(word.toLowerCase()));
+    
+    let finalSegments = segments;
+    if (!segments || segments.length === 0) {
+      const tempDir = path.join(__dirname, 'temp');
+      const audioPath = path.join(tempDir, `${fileId}_audio.wav`);
+      const jsonPath = path.join(tempDir, `${fileId}_audio.json`);
+      
+      await fs.mkdir(tempDir, { recursive: true });
+      await extractAudio(inputPath, audioPath);
+      await transcribeAudio(audioPath, tempDir, language, 'large');
+      
+      const entries = await parseWhisperJson(jsonPath);
+      const result = findProfanityTimestamps(entries, language, selectedWords);
+      finalSegments = result.segments;
+      
+      await fs.unlink(audioPath).catch(() => {});
+      await fs.unlink(jsonPath).catch(() => {});
+    }
+    
+    const result = await muteProfanitySegments(inputPath, outputPath, finalSegments);
+    
+    session.currentVersion++;
+    const editEntry = {
+      version: session.currentVersion,
+      type: 'profanity_filter',
+      filename: result.filename,
+      sourceVersion,
+      timestamp: new Date(),
+      segmentsMuted: finalSegments.length,
+      selectedWords
+    };
+    
+    const history = editHistory.get(sessionId) || [];
+    history.push(editEntry);
+    editHistory.set(sessionId, history);
+    
+    // Parse the transcript from Whisper JSON (or reuse the one you already have)
+    const tempDir = path.join(__dirname, 'temp');
+    const jsonPath = path.join(tempDir, `${fileId}_audio.json`);
+    let transcript = [];
+    try {
+      transcript = await parseWhisperJson(jsonPath);
+    } catch (e) {
+      transcript = [];
+    }
     
     res.json({
       success: true,
-      file: fileInfo,
-      videoInfo
+      outputFile: result.filename,
+      downloadUrl: `/api/download/${result.filename}`,
+      version: session.currentVersion,
+      segmentsMuted: finalSegments.length,
+      transcript,
+      profanityData: { segments: finalSegments }
     });
   } catch (error) {
-    logProgress('💥', 'Upload processing error', { error: error.message });
-    console.error('Upload error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/process/multi-trim-join', async (req, res) => {
+  const { sessionId, videoSegments, outputName } = req.body;
+  logProgress('🚀', 'Starting multi-video trim and join');
+  
+  try {
+    const session = videoSessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    // Validate videoSegments
+    if (!Array.isArray(videoSegments) || videoSegments.length === 0) {
+      return res.status(400).json({ error: 'No video segments provided' });
+    }
+    for (const videoSeg of videoSegments) {
+      if (!videoSeg.videoId || !Array.isArray(videoSeg.segments) || videoSeg.segments.length === 0) {
+        return res.status(400).json({ error: 'Malformed videoSegments: each entry must have videoId and non-empty segments array' });
+      }
+      for (const segment of videoSeg.segments) {
+        if (typeof segment.start !== 'number' || typeof segment.end !== 'number' || segment.start >= segment.end) {
+          return res.status(400).json({ error: 'Malformed segment: start and end must be numbers and start < end' });
+        }
+      }
+    }
+    
+    const outputPath = path.join(__dirname, 'processed', `${outputName || 'multi_video_joined'}_v${session.currentVersion + 1}.mp4`);
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    
+    let filterComplex = '';
+    let concatInputs = '';
+    const inputFiles = [];
+    
+    videoSegments.forEach((videoSeg, videoIndex) => {
+      const video = session.videos.find(v => v.id === videoSeg.videoId);
+      if (!video) throw new Error(`Video ${videoSeg.videoId} not found in session`);
+      inputFiles.push(video.path);
+      videoSeg.segments.forEach((segment, segIndex) => {
+        const { start, end } = segment;
+        const labelIndex = `${videoIndex}_${segIndex}`;
+        filterComplex += `[${videoIndex}:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${labelIndex}];`;
+        filterComplex += `[${videoIndex}:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${labelIndex}];`;
+        concatInputs += `[v${labelIndex}][a${labelIndex}]`;
+      });
+    });
+    
+    const totalSegments = videoSegments.reduce((sum, vs) => sum + vs.segments.length, 0);
+    filterComplex += `${concatInputs}concat=n=${totalSegments}:v=1:a=1[outv][outa]`;
+    
+    // Log filterComplex and input files for debugging
+    logProgress('🛠️', 'FFmpeg filterComplex', { filterComplex });
+    logProgress('🗂️', 'FFmpeg input files', { inputFiles });
+    
+    const command = ffmpeg();
+    inputFiles.forEach(file => command.input(file));
+    
+    await new Promise((resolve, reject) => {
+      command
+        .outputOptions([
+          '-filter_complex', filterComplex,
+          '-map', '[outv]',
+          '-map', '[outa]',
+          '-c:v', 'libx264',
+          '-preset', 'medium',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-movflags', '+faststart'
+        ])
+        .output(outputPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+    
+    session.currentVersion++;
+    const editEntry = {
+      version: session.currentVersion,
+      type: 'multi_trim_join',
+      filename: path.basename(outputPath),
+      sourceVersion: 'multiple',
+      timestamp: new Date(),
+      videoSegments
+    };
+    
+    const history = editHistory.get(sessionId) || [];
+    history.push(editEntry);
+    editHistory.set(sessionId, history);
+    
+    res.json({
+      success: true,
+      outputFile: path.basename(outputPath),
+      downloadUrl: `/api/download/${path.basename(outputPath)}`,
+      version: session.currentVersion
+    });
+  } catch (error) {
+    logProgress('❌', 'Multi-video processing error', { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/session/:sessionId/history', async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const session = videoSessions.get(sessionId);
+    const history = editHistory.get(sessionId) || [];
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    res.json({
+      success: true,
+      session,
+      history,
+      availableVersions: ['original', ...history.map(h => h.version.toString())]
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/api/process/audio-remove', async (req, res) => {
-  const { fileId, segments } = req.body;
-  logProgress('🚀', 'Starting audio removal process', { fileId, segments: segments?.length || 0 });
+  const { fileId, segments, sessionId, sourceVersion = 'original' } = req.body;
+  logProgress('🚀', 'Starting audio removal process');
   
   try {
-    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
-    const outputPath = path.join(__dirname, 'processed', `${fileId}_audio_removed.mp4`);
+    const session = videoSessions.get(sessionId);
+    let inputPath;
     
-    logProgress('📁', 'Creating processed directory');
+    if (sourceVersion === 'original') {
+      inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
+    } else {
+      const history = editHistory.get(sessionId) || [];
+      const versionEntry = history.find(h => h.version === parseInt(sourceVersion));
+      if (!versionEntry) {
+        return res.status(404).json({ error: 'Version not found' });
+      }
+      inputPath = path.join(__dirname, 'processed', versionEntry.filename);
+    }
+    
+    const outputPath = path.join(__dirname, 'processed', `${fileId}_v${session.currentVersion + 1}_audio_removed.mp4`);
+    
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
     const result = await removeAudioFromSegments(inputPath, outputPath, segments);
     
-    logProgress('🎉', 'Audio removal completed successfully', { outputFile: result.filename });
+    session.currentVersion++;
+    const editEntry = {
+      version: session.currentVersion,
+      type: 'audio_removal',
+      filename: result.filename,
+      sourceVersion,
+      timestamp: new Date(),
+      segments
+    };
+    
+    const history = editHistory.get(sessionId) || [];
+    history.push(editEntry);
+    editHistory.set(sessionId, history);
     
     res.json({
       success: true,
       outputFile: result.filename,
-      downloadUrl: `/api/download/${result.filename}`
+      downloadUrl: `/api/download/${result.filename}`,
+      version: session.currentVersion
     });
   } catch (error) {
-    logProgress('💥', 'Audio removal error', { error: error.message });
-    console.error('Audio removal error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/api/process/trim', async (req, res) => {
-  const { fileId, segments, joinSegments } = req.body;
-  logProgress('🚀', 'Starting video trimming process', { 
-    fileId, 
-    segments: segments?.length || 0, 
-    joinSegments 
-  });
+  const { fileId, segments, joinSegments, sessionId, sourceVersion = 'original' } = req.body;
+  logProgress('🚀', 'Starting video trimming process');
   
   try {
-    const inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
-    const outputPath = path.join(__dirname, 'processed', `${fileId}_trimmed.mp4`);
+    const session = videoSessions.get(sessionId);
+    let inputPath;
     
-    logProgress('📁', 'Creating processed directory');
+    if (sourceVersion === 'original') {
+      inputPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
+    } else {
+      const history = editHistory.get(sessionId) || [];
+      const versionEntry = history.find(h => h.version === parseInt(sourceVersion));
+      if (!versionEntry) {
+        return res.status(404).json({ error: 'Version not found' });
+      }
+      inputPath = path.join(__dirname, 'processed', versionEntry.filename);
+    }
+    
+    const outputPath = path.join(__dirname, 'processed', `${fileId}_v${session.currentVersion + 1}_trimmed.mp4`);
+    
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
     const result = await trimVideo(inputPath, outputPath, segments, joinSegments);
     
-    logProgress('🎉', 'Video trimming completed successfully', { outputFile: result.filename });
+    session.currentVersion++;
+    const editEntry = {
+      version: session.currentVersion,
+      type: 'trim',
+      filename: result.filename,
+      sourceVersion,
+      timestamp: new Date(),
+      segments,
+      joinSegments
+    };
+    
+    const history = editHistory.get(sessionId) || [];
+    history.push(editEntry);
+    editHistory.set(sessionId, history);
     
     res.json({
       success: true,
       outputFile: result.filename,
-      downloadUrl: `/api/download/${result.filename}`
+      downloadUrl: `/api/download/${result.filename}`,
+      version: session.currentVersion
     });
   } catch (error) {
-    logProgress('💥', 'Video trimming error', { error: error.message });
-    console.error('Trim error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -414,63 +707,52 @@ app.get('/api/download/:filename', async (req, res) => {
     const exists = await fs.access(filePath).then(() => true).catch(() => false);
     
     if (!exists) {
-      logProgress('❌', 'Download failed - File not found', { filename });
       return res.status(404).json({ error: 'File not found' });
     }
     
-    logProgress('✅', 'Starting file download', { filename });
     res.download(filePath);
   } catch (error) {
-    logProgress('💥', 'Download error', { filename, error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
 
-app.delete('/api/files/:fileId', async (req, res) => {
-  const fileId = req.params.fileId;
-  logProgress('🗑️', 'Starting file cleanup', { fileId });
+app.delete('/api/session/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  logProgress('🗑️', 'Starting session cleanup');
   
   try {
-    const uploadPath = path.join(__dirname, 'uploads', `${fileId}.mp4`);
-    const processedDir = path.join(__dirname, 'processed');
+    const session = videoSessions.get(sessionId);
+    const history = editHistory.get(sessionId) || [];
     
-    logProgress('🧹', 'Removing upload file');
-    await fs.unlink(uploadPath).catch(() => {});
-    
-    logProgress('🧹', 'Scanning for processed files to remove');
-    const processedFiles = await fs.readdir(processedDir);
-    let removedCount = 0;
-    
-    for (const file of processedFiles) {
-      if (file.includes(fileId)) {
-        await fs.unlink(path.join(processedDir, file)).catch(() => {});
-        removedCount++;
-        logProgress('🗑️', `Removed processed file: ${file}`);
+    if (session) {
+      for (const video of session.videos) {
+        await fs.unlink(video.path).catch(() => {});
       }
     }
     
-    logProgress('✅', `File cleanup completed - Removed ${removedCount + 1} files`);
+    for (const edit of history) {
+      const filePath = path.join(__dirname, 'processed', edit.filename);
+      await fs.unlink(filePath).catch(() => {});
+    }
+    
+    videoSessions.delete(sessionId);
+    editHistory.delete(sessionId);
+    
     res.json({ success: true });
   } catch (error) {
-    logProgress('💥', 'File cleanup error', { fileId, error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
 
 async function getVideoInfo(filePath) {
-  logProgress('🔍', 'Analyzing video file', { path: path.basename(filePath) });
-  
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) {
-        logProgress('❌', 'Video analysis failed', { error: err.message });
-        return reject(err);
-      }
+      if (err) return reject(err);
       
       const videoStream = metadata.streams.find(s => s.codec_type === 'video');
       const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
       
-      const info = {
+      resolve({
         duration: metadata.format.duration,
         size: metadata.format.size,
         format: metadata.format.format_name,
@@ -485,37 +767,21 @@ async function getVideoInfo(filePath) {
           channels: audioStream?.channels,
           sampleRate: audioStream?.sample_rate
         }
-      };
-      
-      logProgress('✅', 'Video analysis completed', {
-        duration: `${Math.round(info.duration)}s`,
-        resolution: info.video.resolution,
-        format: info.format
       });
-      
-      resolve(info);
     });
   });
 }
 
 async function removeAudioFromSegments(inputPath, outputPath, segments) {
-  logProgress('🔇', 'Starting audio removal from segments', { 
-    input: path.basename(inputPath),
-    segments: segments?.length || 0
-  });
-  
   return new Promise((resolve, reject) => {
     let filter = '[0:a]';
     
     if (segments && segments.length > 0) {
-      logProgress('🔧', 'Building audio filter for segment removal');
       const volumeConditions = segments.map(({ start, end }) => 
         `between(t,${start},${end})`
       ).join('+');
-      
       filter += `volume=enable='${volumeConditions}':volume=0[outa]`;
     } else {
-      logProgress('ℹ️', 'No segments specified - copying audio as-is');
       filter += 'copy[outa]';
     }
     
@@ -529,35 +795,16 @@ async function removeAudioFromSegments(inputPath, outputPath, segments) {
         '-movflags', '+faststart'
       ])
       .output(outputPath)
-      .on('start', (commandLine) => {
-        logProgress('⚡', 'FFmpeg audio removal started', { command: commandLine });
-      })
-      .on('progress', (progress) => {
-        logProgress('📈', `Audio removal progress: ${Math.round(progress.percent || 0)}%`);
-      })
-      .on('end', () => {
-        logProgress('✅', 'Audio removal completed successfully');
-        resolve({ filename: path.basename(outputPath) });
-      })
-      .on('error', (err) => {
-        logProgress('❌', 'Audio removal failed', { error: err.message });
-        reject(err);
-      })
+      .on('end', () => resolve({ filename: path.basename(outputPath) }))
+      .on('error', reject)
       .run();
   });
 }
 
 async function trimVideo(inputPath, outputPath, segments, joinSegments) {
-  logProgress('✂️', 'Starting video trimming', { 
-    input: path.basename(inputPath),
-    segments: segments?.length || 0,
-    joinSegments
-  });
-  
   return new Promise((resolve, reject) => {
     if (segments.length === 1 && !joinSegments) {
       const { start, end } = segments[0];
-      logProgress('🎬', `Trimming single segment: ${start}s to ${end}s (duration: ${end - start}s)`);
       
       ffmpeg(inputPath)
         .outputOptions([
@@ -570,29 +817,15 @@ async function trimVideo(inputPath, outputPath, segments, joinSegments) {
           '-movflags', '+faststart'
         ])
         .output(outputPath)
-        .on('start', (commandLine) => {
-          logProgress('⚡', 'FFmpeg single trim started', { command: commandLine });
-        })
-        .on('progress', (progress) => {
-          logProgress('📈', `Trimming progress: ${Math.round(progress.percent || 0)}%`);
-        })
-        .on('end', () => {
-          logProgress('✅', 'Single segment trim completed');
-          resolve({ filename: path.basename(outputPath) });
-        })
-        .on('error', (err) => {
-          logProgress('❌', 'Single segment trim failed', { error: err.message });
-          reject(err);
-        })
+        .on('end', () => resolve({ filename: path.basename(outputPath) }))
+        .on('error', reject)
         .run();
     } else if (joinSegments && segments.length > 1) {
-      logProgress('🔗', `Trimming and joining ${segments.length} segments`);
       let filterComplex = '';
       let concatInputs = '';
       
       segments.forEach((segment, i) => {
         const { start, end } = segment;
-        logProgress('📝', `Segment ${i + 1}: ${start}s to ${end}s (${end - start}s)`);
         filterComplex += `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}];`;
         filterComplex += `[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}];`;
         concatInputs += `[v${i}][a${i}]`;
@@ -612,31 +845,16 @@ async function trimVideo(inputPath, outputPath, segments, joinSegments) {
           '-movflags', '+faststart'
         ])
         .output(outputPath)
-        .on('start', (commandLine) => {
-          logProgress('⚡', 'FFmpeg multi-segment trim started', { command: commandLine });
-        })
-        .on('progress', (progress) => {
-          logProgress('📈', `Multi-segment trimming progress: ${Math.round(progress.percent || 0)}%`);
-        })
-        .on('end', () => {
-          logProgress('✅', `Multi-segment trim completed - ${segments.length} segments joined`);
-          resolve({ filename: path.basename(outputPath) });
-        })
-        .on('error', (err) => {
-          logProgress('❌', 'Multi-segment trim failed', { error: err.message });
-          reject(err);
-        })
+        .on('end', () => resolve({ filename: path.basename(outputPath) }))
+        .on('error', reject)
         .run();
     } else {
-      const error = 'Invalid trim configuration';
-      logProgress('❌', error);
-      reject(new Error(error));
+      reject(new Error('Invalid trim configuration'));
     }
   });
 }
 
-// Server startup
 app.listen(PORT, () => {
   logProgress('🚀', `Server started successfully on port ${PORT}`);
-  logProgress('🌟', 'Video processing server is ready to handle requests!');
+  logProgress('🌟', 'Enhanced video processing server ready!');
 });
