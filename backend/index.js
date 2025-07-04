@@ -175,7 +175,7 @@ async function extractAudio(inputPath, outputPath) {
   });
 }
 
-async function transcribeAudio(audioPath, tempDir, language = 'hi', model = 'large') {
+async function transcribeAudio(audioPath, tempDir, language = 'hi', model = 'medium') {
   logProgress('🎙️', `Starting audio transcription with Whisper model: ${model}`);
   return new Promise((resolve, reject) => {
     exec(
